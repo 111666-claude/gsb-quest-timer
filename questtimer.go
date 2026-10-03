@@ -1,21 +1,23 @@
 // Package questtimer 是任务限时：暂停顺延、到期判定与超时结算幂等。
-// 缺陷：暂停不影响计时、恢复不补偿暂停时长、到期判定漏掉等号、暂停中也算过期、
-// 结算不看是否过期也不幂等、每次查询遍历全部任务。
 package questtimer
 
 // Timer 是任务计时台账。
 type Timer struct {
 	deadline map[string]int64
 	pausedAt map[string]int64
-	pausedMs map[string]int64
+	settled  map[string]bool
 	memo     map[string]bool
 	scanned  int
 }
 
 // New 建台账。
 func New() *Timer {
-	return &Timer{deadline: map[string]int64{}, pausedAt: map[string]int64{},
-		pausedMs: map[string]int64{}, memo: map[string]bool{}}
+	return &Timer{
+		deadline: map[string]int64{},
+		pausedAt: map[string]int64{},
+		settled:  map[string]bool{},
+		memo:     map[string]bool{},
+	}
 }
 
 // Start 开始一个限时任务。
@@ -23,33 +25,57 @@ func (t *Timer) Start(quest string, durationMs, nowMs int64) {
 	t.deadline[quest] = nowMs + durationMs
 }
 
-// Pause 暂停计时。
+// Pause 暂停计时；重复暂停返回 false。
 func (t *Timer) Pause(quest string, nowMs int64) bool {
-	t.scanned += len(t.deadline)
-	t.pausedAt[quest] = 0
+	if _, ok := t.deadline[quest]; !ok {
+		return false
+	}
+	if _, ok := t.pausedAt[quest]; ok {
+		return false
+	}
+	t.scanned++
+	t.pausedAt[quest] = nowMs
 	return true
 }
 
-// Resume 恢复计时。
+// Resume 恢复计时，并把暂停时长补到截止时刻上。
 func (t *Timer) Resume(quest string, nowMs int64) bool {
-	t.scanned += len(t.deadline)
+	pausedSince, ok := t.pausedAt[quest]
+	if !ok {
+		return false
+	}
+	t.scanned++
+	t.deadline[quest] += nowMs - pausedSince
 	delete(t.pausedAt, quest)
 	return true
 }
 
-// Expired 判断任务是否超时。
+// Expired 判断任务是否超时：当前时刻不小于截止时刻且未暂停时算超时。
 func (t *Timer) Expired(quest string, nowMs int64) bool {
-	t.scanned += len(t.deadline)
+	t.scanned++
+	if t.settled[quest] {
+		return true
+	}
+	if _, paused := t.pausedAt[quest]; paused {
+		return false
+	}
 	deadline, ok := t.deadline[quest]
 	if !ok {
 		return false
 	}
-	return nowMs > deadline
+	return nowMs >= deadline
 }
 
-// Settle 结算一次超时，返回是否成功。
+// Settle 结算一次超时：只有已经超时、未结算且 reqID 未用过时才成功。
 func (t *Timer) Settle(quest string, nowMs int64, reqID string) bool {
-	t.scanned += len(t.deadline)
+	t.scanned++
+	if !t.Expired(quest, nowMs) {
+		return false
+	}
+	if t.settled[quest] || t.memo[reqID] {
+		return false
+	}
+	t.settled[quest] = true
 	t.memo[reqID] = true
 	return true
 }
